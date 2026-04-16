@@ -45,3 +45,5 @@ yarn-error.log*
 # VS Code User settings (keep workspace recommendations)
 .vscode/launch.json
 .vscode/tasks.json
+
+CLAUDE_CODE/

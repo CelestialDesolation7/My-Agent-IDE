@@ -77,15 +77,16 @@ day8/
 │  ├─ ipc/
 │  │  └─ chat.ipc.ts                               (修改：新增 file-change 推送 + revert-file)
 │  └─ services/agent/
-│     ├─ agent-loop.ts                             (修改：AgentLoopCallbacks 新增 onFileChange)
-│     ├─ chat.service.ts                           (修改：ChatCallbacks 新增 onFileChange)
+│     ├─ agent-loop.ts                             (修改：onFileChange + 文本工具调用回退 + 完整历史透传)
+│     ├─ chat.service.ts                           (修改：onFileChange + 完整历史保存 + 默认 Ollama 配置)
 │     ├─ providers/
 │     │  ├─ base.provider.ts                       (修改：ProviderConfig 扩展)
-│     │  └─ openai.provider.ts                     (修改：透传 temperature)
+│     │  └─ openai.provider.ts                     (修改：透传 temperature + Ollama 流式兼容)
 │     └─ tools/
 │        ├─ tool-registry.ts                       (修改：ToolContext 新增 onFileChange)
 │        ├─ edit-file.tool.ts                      (修改：调用 onFileChange)
 │        └─ write-file.tool.ts                     (修改：记录旧内容 + 调用 onFileChange)
+├─ test-agent-debug.mjs                            (新增：Agent 诊断测试脚本)
 └─ README-day8.md                                   (新增)
 ```
 
@@ -817,11 +818,274 @@ function buildSystemPrompt(workspacePath: string, customPrompt?: string): string
 
 ---
 
-## 10. 完整运行流程追踪
+## 10. 核心增量六：Agent 健壮性——Ollama 兼容与多轮对话修复
+
+### 10.1 问题背景
+
+Day 7 的 Agent 使用 OpenAI SDK 通过 Function Calling API 与模型交互。这对 OpenAI、Anthropic 等云端 API 工作正常，但在连接 **Ollama 本地模型**（如 `qwen2.5-coder:32b-instruct-q4_K_M`）时出现两个严重问题：
+
+1. **工具调用不执行**：UI 上显示了工具调用卡片，但工具从未被实际执行。
+2. **Agent 循环无法多轮迭代**：模型在第一轮后即停止，即使任务需要多步工具调用才能完成。
+
+根因分析发现 4 个 Bug：
+
+| # | Bug | 根因 | 影响 |
+|---|-----|------|------|
+| 1 | Ollama 流式 chunk 缺少 `tc.id` | Ollama 首个 tool_call chunk 不携带 `id` 字段，Provider 的 `if (tc.id)` 分支不匹配，工具调用未被识别 | 工具调用被静默丢弃 |
+| 2 | Ollama 不发送 `finish_reason: "tool_calls"` | Ollama 发送 `finish_reason: "stop"` 或根本不发送，导致 `activeToolCalls` 中已拼装的工具调用永远不会被 yield 为 `tool_call_end` | Provider 输出的工具调用流中没有 end 事件 |
+| 3 | Ollama 把工具调用输出为纯文本 JSON | 某些 Ollama 模型不走 Function Calling 协议，而是直接输出 `{"name":"tool_name","arguments":{...}}` 的 JSON 文本 | AgentLoop 收不到任何 tool_call chunk |
+| 4 | 对话历史在多轮间丢失 | `ChatService.onComplete` 只保存最终文本，不保存工具交互消息（`tool` role message），导致第二轮模型无法理解上一轮工具结果 | 多轮推理断裂 |
+
+### 10.2 修复一：Provider Ollama 流式兼容（openai.provider.ts）
+
+#### Fake ID 生成
+
+```typescript
+// 原逻辑：只在 tc.id 存在时初始化工具调用
+if (tc.id) {
+  activeToolCalls.set(idx, { id: tc.id, name: ..., arguments: ... })
+}
+
+// 新增 Ollama 兼容分支：首个 chunk 无 id 但有 function.name 时，生成假 ID
+else if (!activeToolCalls.has(idx) && tc.function?.name) {
+  const fakeId = `call_${Date.now()}_${idx}`
+  activeToolCalls.set(idx, {
+    id: fakeId,
+    name: tc.function.name,
+    arguments: tc.function?.arguments ?? "",
+  })
+}
+```
+
+解释：
+1. OpenAI 标准协议中，`tc.id`（如 `call_abc123`）在第一个 chunk 就给出。Ollama 的 OpenAI 兼容层有时不发送此字段。
+2. 我们用 `Date.now()` + `index` 生成唯一假 ID。这个 ID 仅用于在对话历史中关联 `tool_call_id`，不影响工具执行。
+3. `tc.index ?? 0` 也做了回退——Ollama 可能不发送 `index` 字段。
+
+#### Safety Net（安全网）
+
+```typescript
+// 原逻辑在 finish_reason 时才 yield tool_call_end
+// 新增：流结束后仍有未完成的工具调用，补发 tool_call_end
+if (activeToolCalls.size > 0) {
+  for (const [, tc] of activeToolCalls) {
+    yield {
+      type: "tool_call_end",
+      toolCall: { id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } },
+    }
+  }
+  activeToolCalls.clear()
+}
+```
+
+解释：这是一个**防御性编程模式**（Safety Net）。正常流程中，`finish_reason` 触发 flush。但如果 Ollama 不发送 `finish_reason`（或发送 `"stop"` 而非 `"tool_calls"`），流结束时 `activeToolCalls` 仍有数据。这段代码确保无论流如何结束，已收集到的工具调用都能被正确传递。
+
+### 10.3 修复二：文本工具调用回退解析（agent-loop.ts）
+
+当 Provider 层完全没有检测到工具调用（`completedToolCalls.length === 0`），但模型实际上把工具调用写成了 JSON 文本时，AgentLoop 进行文本回退解析。
+
+#### findMatchingBrace 算法
+
+```typescript
+function findMatchingBrace(text: string, start: number): number {
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = start; i < text.length; i++) {
+    if (esc) { esc = false; continue }
+    if (text[i] === "\\" && inStr) { esc = true; continue }
+    if (text[i] === '"') { inStr = !inStr; continue }
+    if (inStr) continue
+    if (text[i] === "{") depth++
+    else if (text[i] === "}") depth--
+    if (depth === 0) return i
+  }
+  return -1
+}
+```
+
+这是一个**状态机**，追踪三个状态：
+- `depth`：花括号嵌套深度。遇到 `{` 加 1，遇到 `}` 减 1，减到 0 时找到配对位置。
+- `inStr`：是否在 JSON 字符串内部。字符串内的 `{` 和 `}` 不计入深度。
+- `esc`：上一个字符是否为转义符 `\`。`\"` 不应切换 `inStr` 状态。
+
+为什么不用 `JSON.parse()` 直接解析？因为模型输出的文本中可能混有自然语言（如 "让我帮你列出文件：`{\"name\":\"list_files\",...}`"），直接 parse 整段文本会失败。
+
+#### parseToolCallsFromText 算法
+
+```typescript
+function parseToolCallsFromText(text: string, toolNames: Set<string>) {
+  const results = []
+  let i = 0
+  while (i < text.length) {
+    if (text[i] === "{") {
+      const end = findMatchingBrace(text, i)
+      if (end > i) {
+        try {
+          const obj = JSON.parse(text.substring(i, end + 1))
+          if (obj.name && toolNames.has(obj.name)) {
+            results.push({
+              name: obj.name,
+              arguments: obj.arguments || obj.parameters || {},
+            })
+            i = end + 1; continue
+          }
+        } catch { /* 不是合法 JSON */ }
+      }
+    }
+    i++
+  }
+  return results
+}
+```
+
+逻辑：
+1. 逐字符扫描文本，遇到 `{` 时尝试找配对的 `}`。
+2. 截取子串尝试 `JSON.parse()`。
+3. 解析成功后，检查 `obj.name` 是否在已注册的工具名集合中——**只有匹配已知工具名的 JSON 才被视为工具调用**，避免误识别。
+4. 兼容不同模型的输出格式：参数可能在 `obj.arguments` 或 `obj.parameters` 中。
+
+#### AgentLoop 中的回退触发
+
+```typescript
+if (completedToolCalls.length === 0 && currentText.trim()) {
+  const registeredNames = new Set(this.toolRegistry.getAll().map((t) => t.name))
+  const textParsed = parseToolCallsFromText(currentText, registeredNames)
+  if (textParsed.length > 0) {
+    for (let i = 0; i < textParsed.length; i++) {
+      const fakeId = `text_call_${Date.now()}_${i}`
+      // ... 构造 completedToolCalls 条目
+    }
+  }
+}
+```
+
+注意：回退解析只在 `completedToolCalls.length === 0` 时触发。如果 Provider 已经通过 Function Calling API 正常返回了工具调用，回退逻辑**不会**运行，避免重复执行。
+
+### 10.4 修复三：完整对话历史透传（agent-loop.ts + chat.service.ts）
+
+#### 问题复现
+
+Day 7 的 `onComplete` 签名：
+
+```typescript
+onComplete(fullText: string): void
+```
+
+`ChatService` 在收到 `onComplete` 后，只保存了最终文本：
+
+```typescript
+this.messages.push({ role: "assistant", content: fullText })
+```
+
+这意味着**工具交互消息（`tool` role）被丢弃了**。当用户进行第二轮对话时，模型看到的上下文中没有工具调用和结果，无法理解之前发生了什么。
+
+#### 修复方案
+
+**AgentLoop 侧**——`onComplete` 新增第二个参数：
+
+```typescript
+onComplete(fullText: string, conversationMessages?: Message[]): void
+```
+
+所有退出点都传递完整对话历史（去除系统提示词）：
+
+```typescript
+callbacks.onComplete(fullText, conversationMessages.slice(1))
+```
+
+`slice(1)` 去掉索引 0 的系统提示词消息——系统提示词由 AgentLoop 在每次 `run()` 时动态注入，不应存储在 `ChatService.messages` 中。
+
+**ChatService 侧**——保存完整历史：
+
+```typescript
+onComplete: (fullText, conversationMessages) => {
+  if (conversationMessages && conversationMessages.length > 0) {
+    this.messages = conversationMessages  // 替换整个历史
+  } else if (fullText) {
+    this.messages.push({ role: "assistant", content: fullText })
+  }
+  callbacks.onComplete(fullText)
+},
+```
+
+这样 `this.messages` 包含了完整的对话链路：
+
+```
+[user] → [assistant + tool_calls] → [tool result] → [assistant + tool_calls] → [tool result] → [assistant]
+```
+
+### 10.5 修复四：默认 Ollama 配置（chat.service.ts）
+
+```typescript
+private loadSettings(): void {
+  try {
+    if (existsSync(this.settingsPath)) {
+      const config = JSON.parse(readFileSync(this.settingsPath, "utf-8"))
+      this.providerConfig = config
+      this.provider = new OpenAIProvider(config)
+    } else {
+      // 默认 Ollama 配置：无需 API Key，连接本地 Ollama 服务。
+      const defaultConfig: ProviderConfig = {
+        apiKey: "ollama",
+        baseURL: "http://localhost:11434/v1",
+        model: "qwen2.5-coder:32b-instruct-q4_K_M",
+      }
+      this.providerConfig = defaultConfig
+      this.provider = new OpenAIProvider(defaultConfig)
+    }
+  } catch { /* ignore */ }
+}
+```
+
+解释：
+1. Ollama 的 OpenAI 兼容端点不校验 API Key，但 OpenAI SDK 要求 `apiKey` 非空，因此使用 `"ollama"` 作为占位符。
+2. `http://localhost:11434/v1` 是 Ollama 默认的 OpenAI 兼容端点。
+3. 只在配置文件不存在时使用默认值——用户通过设置面板保存过配置后，后续启动读取已保存的配置。
+
+### 10.6 诊断测试脚本（test-agent-debug.mjs）
+
+为了在不启动 Electron 的情况下验证 Agent 功能，创建了独立的 Node.js 诊断脚本：
+
+```javascript
+// test-agent-debug.mjs —— 核心结构
+import OpenAI from "openai"
+
+const client = new OpenAI({ apiKey: "ollama", baseURL: "http://localhost:11434/v1" })
+
+// 注册工具定义（与 tool-registry 保持一致）
+const tools = [{ type: "function", function: { name: "list_files", ... } }]
+
+// Agent 主循环
+for (let turn = 0; turn < MAX_TURNS; turn++) {
+  const stream = await client.chat.completions.create({ model, messages, tools, stream: true })
+
+  // 1. 消费流式 chunk（统计 tool_call 数量、检查 finish_reason）
+  // 2. 如果 API 层检测到工具调用 → 执行
+  // 3. 如果 API 层未检测到 → 文本回退解析（parseToolCallsFromText）
+  // 4. 将工具结果追加到 messages → 继续循环
+}
+```
+
+使用方法：
+
+```powershell
+node test-agent-debug.mjs .
+```
+
+脚本会输出详细的诊断信息：
+- 每个 chunk 的 `tool_calls` 数量和 `finish_reason`
+- 工具调用检测方式（"API detected" 或 "text fallback parsed"）
+- 每一轮的工具执行结果
+- 完整的对话消息历史
+
+---
+
+## 11. 完整运行流程追踪
 
 ### 示例：用户说"帮我在 README.md 末尾添加一段项目描述"
 
-#### 10.1 用户消息 → Agent 循环
+#### 11.1 用户消息 → Agent 循环
 
 ```
 ChatInput 输入 → chat.store.sendMessage()
@@ -830,7 +1094,7 @@ ChatInput 输入 → chat.store.sendMessage()
       → AgentLoop.run()
 ```
 
-#### 10.2 Agent 第一轮——读取文件
+#### 11.2 Agent 第一轮——读取文件
 
 ```
 模型推理：需要先看 README.md 当前内容
@@ -839,7 +1103,7 @@ ChatInput 输入 → chat.store.sendMessage()
 → tool 消息回传给模型
 ```
 
-#### 10.3 Agent 第二轮——修改文件
+#### 11.3 Agent 第二轮——修改文件
 
 ```
 模型推理：在末尾追加内容，使用 edit_file
@@ -855,7 +1119,7 @@ ChatInput 输入 → chat.store.sendMessage()
   ④ context.onFileChange() ← 触发 Inline Diff 链路！
 ```
 
-#### 10.4 文件变更事件传播
+#### 11.4 文件变更事件传播
 
 ```
 context.onFileChange({ filePath, oldContent, newContent, toolName: "edit_file" })
@@ -868,7 +1132,7 @@ context.onFileChange({ filePath, oldContent, newContent, toolName: "edit_file" }
               → React 重渲染
 ```
 
-#### 10.5 用户看到 Diff 视图
+#### 11.5 用户看到 Diff 视图
 
 ```
 EditorArea 渲染 Pending Diff 标签栏（显示 "README.md"）
@@ -878,7 +1142,7 @@ InlineDiffView 调用 computeDiff(oldContent, newContent)
   → 渲染：绿色背景 = 新增行，红色背景 = 删除行
 ```
 
-#### 10.6 用户点击 Accept
+#### 11.6 用户点击 Accept
 
 ```
 用户点击 Accept 按钮
@@ -902,9 +1166,9 @@ InlineDiffView 调用 computeDiff(oldContent, newContent)
 
 ---
 
-## 11. Day 8 必学知识点
+## 12. Day 8 必学知识点
 
-### 11.1 CSS 自定义属性 vs Tailwind 硬编码
+### 12.1 CSS 自定义属性 vs Tailwind 硬编码
 
 | | Tailwind 硬编码 | CSS 自定义属性 |
 |---|---|---|
@@ -913,7 +1177,7 @@ InlineDiffView 调用 computeDiff(oldContent, newContent)
 | 一致性 | 开发者可能用错相近色号 | 变量名有明确语义 |
 | 适用阶段 | 原型开发 | 正式项目 |
 
-### 11.2 LCS 算法
+### 12.2 LCS 算法
 
 LCS（Longest Common Subsequence）是经典的动态规划问题：
 - 输入：两个序列（这里是两个文件的行数组）
@@ -921,13 +1185,13 @@ LCS（Longest Common Subsequence）是经典的动态规划问题：
 - 时间复杂度：$O(m \times n)$
 - 空间复杂度：$O(m \times n)$（可优化为 $O(\min(m, n))$）
 
-### 11.3 事件推送 vs 请求响应
+### 12.3 事件推送 vs 请求响应
 
 Day 8 同时使用了两种 IPC 模式：
 - **推送（Push）**：`webContents.send("chat:file-change", data)` —— 主进程主动推送，渲染进程被动接收。用于实时通知。
 - **请求响应（Request-Response）**：`ipcRenderer.invoke("chat:revert-file", ...)` —— 渲染进程主动请求，等待结果。用于用户操作。
 
-### 11.4 可选链调用（Optional Chaining）
+### 12.4 可选链调用（Optional Chaining）
 
 Day 8 大量使用 `context.onFileChange?.({...})` 语法：
 
@@ -940,9 +1204,49 @@ if (context.onFileChange) {
 
 `?.` 是 TypeScript/JavaScript 的可选链操作符：如果左侧为 `undefined` 或 `null`，跳过调用，不抛异常。
 
+### 12.5 OpenAI Function Calling vs Ollama 文本输出
+
+| | OpenAI 标准 Function Calling | Ollama 文本输出 |
+|---|---|---|
+| 工具调用位置 | `delta.tool_calls` 字段 | 响应文本中的 JSON |
+| `tc.id` | 首个 chunk 携带（如 `call_abc123`） | 通常缺失 |
+| `finish_reason` | `"tool_calls"` | `"stop"` 或不发送 |
+| 参数传递 | 增量拼接 `arguments` 字符串 | 一次性输出完整 JSON |
+| 解析方式 | Provider 层 stream 解析 | 文本回退解析（`parseToolCallsFromText`） |
+
+教训：当你的应用需要支持多个 LLM Provider 时，**不能假设所有模型都严格遵守 OpenAI 的 Function Calling 协议**。需要在 Provider 层做兼容处理，并在上层准备回退方案。
+
+### 12.6 Safety Net（安全网）模式
+
+Safety Net 是一种防御性编程模式：在正常流程之后添加一道"兜底"逻辑，确保即使前置流程未按预期工作，系统仍能正确运行。
+
+Day 8 中的两个 Safety Net 实例：
+1. **Provider 层**：流结束后检查 `activeToolCalls.size > 0`，补发 `tool_call_end`。
+2. **AgentLoop 层**：API 未检测到工具调用时，从文本中回退解析。
+
+Safety Net 的设计原则：
+- **不影响正常路径**：正常流程走完后 Safety Net 的条件不满足，不会执行。
+- **幂等性**：Safety Net 执行后不会产生重复副作用（如 `activeToolCalls.clear()` 防止重复 yield）。
+- **日志可观测**：生产环境中应在 Safety Net 触发时记录日志，方便排查。
+
+### 12.7 对话历史中的工具消息约束
+
+OpenAI API 对消息序列有严格的结构约束：
+
+```
+[system] → [user] → [assistant + tool_calls] → [tool (tool_call_id=xxx)] → [assistant]
+```
+
+关键规则：
+1. **`tool` 消息必须紧跟在包含对应 `tool_call_id` 的 `assistant` 消息之后**。如果 `assistant` 消息声明了 3 个 tool_calls，后面必须有 3 条对应的 `tool` 消息。
+2. **`tool_call_id` 必须匹配**。每条 `tool` 消息的 `tool_call_id` 必须与某个 `assistant` 消息中的 `tool_calls[].id` 一致。
+3. **不能跳过工具结果**。如果 `assistant` 声明了工具调用但没有后续 `tool` 消息，API 会报错。
+
+这就是为什么 Day 8 修复对话历史时选择**替换整个 `this.messages`** 而非追加——`AgentLoop` 内部维护的 `conversationMessages` 已经保证了消息序列的结构正确性。
+
 ---
 
-## 12. Day 8 检查项
+## 13. Day 8 检查项
 
 1. `npm run dev` 可正常启动，整体配色为深蓝灰色调。
 2. 各按钮悬停有统一的过渡动画效果。
@@ -953,10 +1257,14 @@ if (context.onFileChange) {
 7. 点击 Reject → 文件恢复原内容，编辑器显示旧内容。
 8. 修改 Temperature 后让 Agent 回答问题，观察输出是否更随机/更确定。
 9. 在 System Prompt 中写"回答使用英文"，验证 Agent 是否遵守。
+10. 首次启动时未配置设置，确认默认连接 Ollama（`http://localhost:11434/v1`）。
+11. 在 Ollama 环境下让 Agent 调用工具（如"列出当前目录文件"），确认工具实际执行并返回结果。
+12. Agent 多轮对话测试：先让 Agent 读一个文件，再让它修改，确认第二轮能基于第一轮的工具结果继续推理。
+13. 运行 `node test-agent-debug.mjs .` 诊断脚本，确认输出显示工具调用检测方式和执行结果。
 
 ---
 
-## 13. 延伸思考
+## 14. 延伸思考
 
 1. **Myers' Diff vs LCS**：Day 8 的 LCS 算法对于 5000 行文件会很慢（$O(n^2)$ 时间/空间）。如何实现 Myers' Diff？参考 `diff` 命令的实现。
 
@@ -967,7 +1275,12 @@ if (context.onFileChange) {
 4. **亮色主题**：尝试添加一个 `.theme-light` CSS 类，覆盖 `:root` 变量实现亮色模式切换。
 
 5. **分块 Accept**：当前只能整文件 Accept/Reject。能否实现"逐行"或"逐块"接受？（提示：VS Code 的 inline suggestions 就是这样做的）
-npm install
+
+6. **模型能力检测**：当前代码无法知道模型是否支持 Function Calling。能否在首次连接时发送一个测试工具调用，自动检测并切换解析策略？
+
+7. **文本解析健壮性**：`parseToolCallsFromText` 依赖 JSON 格式。如果模型输出了 Markdown 代码块包裹的 JSON（`` ```json ... ``` ``），如何增强解析器来处理这种情况？
+
+8. **长对话上下文管理**：当 `this.messages` 累积大量工具调用历史后，会超出模型的上下文窗口限制。如何实现智能的上下文截断或摘要策略？（提示：可以保留最近 N 轮 + 摘要早期历史）
 
 # 开发模式
 npm run dev
